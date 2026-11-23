@@ -73,9 +73,10 @@ def _load_snapshot_df(universe: str) -> pd.DataFrame:
         return entry["df"]
 
     if path.endswith(".csv"):
-        df = pd.read_csv(path)
+        # Keep codes as text: read as int, "002230" becomes 2230 and never matches.
+        df = pd.read_csv(path, dtype={"代码": str})
     else:
-        df = pd.read_json(path, orient="records")
+        df = pd.read_json(path, orient="records", dtype={"代码": str})
 
     _SNAPSHOT_CACHE[universe] = {"path": path, "mtime": mtime, "df": df}
     logger.debug("Loaded snapshot for %s from %s", universe, path)

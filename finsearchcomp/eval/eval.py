@@ -106,25 +106,64 @@ def ensure_snapshots_current() -> None:
     _SNAPSHOT_FRESHNESS_CHECKED = True
 
 
+SCORE_KEYS = ("answer_score", "score")  # T2/T3 judges emit answer_score, T1 judges emit score
+
+
+def _unwrap_score(value):
+    """Accept a flat score (as the judge prompts specify) or the nested [[score]] form."""
+    while isinstance(value, list) and value:
+        value = value[0]
+    return value
+
+
 def parse_judge_output(judge_output: str) -> float:
-    """Parse numerical score from judge's output"""
+    """Parse numerical score from judge's output.
+
+    The judge prompts ask for {"answer_score": <0|1>} (T2/T3) or {"score": <0|1>} (T1),
+    usually inside a plain ``` fence. Returns DEFAULT_ERROR_SCORE when no score is found,
+    and None when a T1 judge reports {"score": "null"} (no real-time data available).
+    """
     if not isinstance(judge_output, str):
         logger.warning(f"Input passed to parse_judge_output is not a string: {type(judge_output)}")
         return DEFAULT_ERROR_SCORE
-    try:
-        # Extract JSON part
-        json_match = re.search(r"```json\s*(\{.*?\})\s*```", judge_output, re.DOTALL)
-        if not json_match:
-            logger.warning(f"Unable to find JSON block from judge output: {judge_output}")
-            return DEFAULT_ERROR_SCORE
 
-        judge_json = json.loads(json_match.group(1))
-        # Extract score, assuming it's nested as [[score]]
-        score = judge_json.get("answer_score", [[DEFAULT_ERROR_SCORE]])[0][0]
-        return float(score)
-    except (json.JSONDecodeError, IndexError, TypeError, ValueError) as e:
-        logger.warning(f"Error parsing judge output JSON or score: {e}\nOutput: {judge_output}")
-        return DEFAULT_ERROR_SCORE
+    # Fenced blocks (with or without the `json` tag, closed by ``` or ``) first, then bare objects.
+    candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*`{2,3}", judge_output, re.DOTALL)
+    candidates += re.findall(r"\{[^{}]*\"(?:answer_score|score)\"[^{}]*\}", judge_output)
+
+    # The final verdict comes last; earlier objects may be quoted examples.
+    for raw in reversed(candidates):
+        try:
+            judge_json = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(judge_json, dict):
+            continue
+        for key in SCORE_KEYS:
+            if key not in judge_json:
+                continue
+            value = _unwrap_score(judge_json[key])
+            if isinstance(value, str) and value.strip().lower() == "null":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                break
+
+    logger.warning(f"Unable to find a score in judge output: {judge_output}")
+    return DEFAULT_ERROR_SCORE
+
+
+def load_judge(model_name):
+    """A provider/model string (e.g. openai/gpt-5-mini) goes through LiteLLM."""
+    if "/" in model_name:
+        from models.litellm_api import load_model as load_litellm
+        return load_litellm(model_name)
+    return load_model(model_name)
+
+
+def is_valid_score(score) -> bool:
+    return score is not None and score != DEFAULT_ERROR_SCORE
 
 
 def evaluate_response(
@@ -157,7 +196,13 @@ def get_judge_user_input(data, response):
         tag = data['tags']
         method = data.get('method', None)
         ensure_snapshots_current()
-        ground_truth = fetch_single(akshare_ticker, tag, method)
+        try:
+            ground_truth = fetch_single(akshare_ticker, tag, method)
+        except ValueError as exc:
+            # e.g. an unsupported tag/method pair: no ground truth, so the judge
+            # answers "null" and the item is left out of accuracy.
+            logger.warning(f"No ground truth for {data['prompt_id']}: {exc}")
+            ground_truth = None
 
         judge_user_input = prompt_template.format(
             prompt = prompt,
@@ -226,21 +271,28 @@ def process_file(data: Dict, model, output_file: str = None):
         }
         
         results["evaluations"].append(eval_result)
-        total_score += evaluation["score"]
+        score = evaluation["score"]
+        if not is_valid_score(score):
+            # Unparseable judge output, or T1 "null" (no real-time data): exclude from accuracy.
+            logger.warning(f"Evaluation {prompt_id} has no valid score ({score}); excluded")
+            continue
+
+        total_score += score
         valid_evals += 1
-        
-        logger.info(f"Evaluation completed {prompt_id}: score {evaluation['score']}")
+        if 'T1' not in str(prompt_id):
+            non_ts_total_score += score
+            non_ts_valid_evals += 1
+
+        logger.info(f"Evaluation completed {prompt_id}: score {score}")
     
     # Calculate total accuracy
+    results["valid"] = valid_evals > 0
     if valid_evals > 0:
-        # Save the total accuracy of all evaluations (including TS) as the original accuracy
-        results["original_accuracy"] = total_score / valid_evals
-        
-        # Use the accuracy of non-TS evaluations as the main accuracy
+        # Accuracy over all evaluations of this item (T1 included).
+        results["accuracy"] = total_score / valid_evals
+        # Accuracy over non-time-sensitive evaluations only (kept for reference).
         if non_ts_valid_evals > 0:
-            results["accuracy"] = non_ts_total_score / non_ts_valid_evals
-        else:
-            results["accuracy"] = 0.0
+            results["non_ts_accuracy"] = non_ts_total_score / non_ts_valid_evals
     
 
     # Save result
@@ -266,6 +318,7 @@ def main():
     parser.add_argument('--input', type=str, required=True, help='Input file path')
     parser.add_argument('--output', type=str, default='result/eval.json', help='Output file path')
     parser.add_argument('--config', type=str, default='config/config.yaml', help='Config file path')
+    parser.add_argument('--workers', type=int, default=1, help='Items judged in parallel')
     args = parser.parse_args()
     
     # Build full path
@@ -289,7 +342,7 @@ def main():
     logger.info(f"Output file: {output_path}")
     
     # Load model
-    model = load_model(args.model_name)
+    model = load_judge(args.model_name)
 
     # Read entire JSON file instead of reading line by line
     with open(input_path, 'r', encoding='utf-8') as f:
@@ -302,17 +355,22 @@ def main():
             total_accuracy_sum = 0.0
             valid_results = 0
             
-            # Process each item in the list
-            for i, item in enumerate(data):
-                # Use a temporary output file for individual results if needed
-                temp_output = None
-                
-                # Process each dialogue object
-                result = process_file(item, model, temp_output)
+            # Refresh T1 snapshots once, before any parallel work.
+            if any('T1' in str(item.get('prompt_id')) for item in data):
+                ensure_snapshots_current()
+
+            if args.workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                    processed = list(pool.map(lambda item: process_file(item, model, None), data))
+            else:
+                processed = (process_file(item, model, None) for item in data)
+
+            for i, result in enumerate(processed):
                 all_results.append(result)
                 
-                # Calculate overall accuracy
-                if "accuracy" in result and result["accuracy"] > 0:
+                # Calculate overall accuracy over every item with a valid score (0 included)
+                if result.get("valid"):
                     total_accuracy_sum += result["accuracy"]
                     valid_results += 1
                     
